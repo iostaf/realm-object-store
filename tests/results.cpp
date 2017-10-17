@@ -334,7 +334,6 @@ TEST_CASE("notifications: async delivery") {
         }
     }
 
-    /*
     SECTION("remote changes made before adding a callback from within a callback are not reported") {
         auto results2 = results;
         NotificationToken token2, token3;
@@ -360,7 +359,6 @@ TEST_CASE("notifications: async delivery") {
         advance_and_notify(*r);
         REQUIRE(called);
     }
-     */
 
     SECTION("notifications are not delivered when a callback is removed from within a callback") {
         NotificationToken token2, token3;
@@ -1158,6 +1156,58 @@ TEST_CASE("notifications: async error handling") {
 }
 #endif
 
+TEST_CASE("stuff") {
+    TestFile config;
+    config.cache = false;
+    config.automatic_change_notifications = false;
+    config.schema = Schema{
+        {"object", {
+            {"value", PropertyType::Int},
+        }},
+    };
+
+    auto r = Realm::get_shared_realm(config);
+
+    auto coordinator = _impl::RealmCoordinator::get_existing_coordinator(config.path);
+    Results results(r, *r->read_group().get_table("class_object"));
+    auto results2 = results;
+
+    NotificationToken token, token2, token3;
+    size_t calls = 0;
+    size_t asdf = 0;
+    token = results.add_notification_callback([&](CollectionChangeSet, std::exception_ptr) {
+        if (asdf++)
+            return;
+        token3 = {};
+        {
+            auto r2 = Realm::get_shared_realm(config);
+            r2->begin_transaction();
+            r2->read_group().get_table("class_object")->add_empty_row();
+            r2->commit_transaction();
+        }
+
+        coordinator->on_change();
+        token2 = results2.add_notification_callback([&](CollectionChangeSet c, std::exception_ptr) {
+            if (calls == 0) {
+                REQUIRE(c.empty());
+            }
+            else {
+                REQUIRE_INDICES(c.insertions, 0);
+            }
+            REQUIRE(results.size() == calls);
+            ++calls;
+        });
+    });
+    token3 = results2.add_notification_callback([&](CollectionChangeSet, std::exception_ptr) {});
+    coordinator->on_change();
+    r->notify();
+
+    REQUIRE(calls == 1);
+    coordinator->on_change();
+    r->notify();
+    REQUIRE(calls == 2);
+}
+
 #if REALM_ENABLE_SYNC
 TEST_CASE("notifications: sync") {
     _impl::RealmCoordinator::assert_no_open_realms();
@@ -1781,6 +1831,57 @@ TEST_CASE("notifications: results") {
             REQUIRE(notification_calls == 2);
             REQUIRE_INDICES(change.insertions, 0);
         }
+    }
+
+    // timings:
+    // write, add notification, on_change
+    // write, on_change, add notification
+    SECTION("removing and readding callbacks") {
+        auto write = [&](auto&& f) {
+            r->begin_transaction();
+            f();
+            r->commit_transaction();
+            advance_and_notify(*r);
+        };
+
+        NotificationToken token = results.add_notification_callback([&](CollectionChangeSet, std::exception_ptr) {
+            token = {};
+        });
+        advance_and_notify(*r);
+
+        write([&] {
+            table->set_int(0, 1, 3);
+        });
+
+        int notification_calls = 0;
+        token = results.add_notification_callback([&](CollectionChangeSet c, std::exception_ptr) {
+            if (notification_calls == 0) {
+                REQUIRE(c.empty());
+            }
+            else if (notification_calls == 1) {
+                REQUIRE_INDICES(c.modifications, 0);
+            }
+            ++notification_calls;
+        });
+
+        int notification_calls = 0;
+        CollectionChangeSet change;
+        auto token = results.add_notification_callback([&](CollectionChangeSet c, std::exception_ptr err) {
+            REQUIRE_FALSE(err);
+            change = c;
+            ++notification_calls;
+        });
+
+        advance_and_notify(*r);
+
+
+        SECTION("swapping rows does not send notifications") {
+            write([&] {
+                table->swap_rows(2, 3);
+            });
+            REQUIRE(notification_calls == 1);
+        }
+        // asd
     }
 
     SECTION("schema changes") {
